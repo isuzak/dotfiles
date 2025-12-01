@@ -16,3 +16,4 @@ if [[ -d /usr/share/omarchy-zsh/functions ]]; then
 fi
 
 # Add your own customizations below
+export PATH="$HOME/bin:$PATH"
