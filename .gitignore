@@ -1,0 +1,4 @@
+.zshrc.secrets
+.zsh_history
+*.swp
+.DS_Store
