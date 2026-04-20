@@ -115,6 +115,7 @@ source $ZSH/oh-my-zsh.sh
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
 alias ls='colorls'
+export PATH="/opt/homebrew/lib/ruby/gems/4.0.0/bin:$PATH"
 alias -g G='| grep'
 alias -g L='| wc -l'
 alias hg='history | grep'
