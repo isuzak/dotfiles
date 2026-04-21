@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# フォントインストールスクリプト
+# 対象: MesloLGS NF / JetBrains Mono / Hack Nerd Font Mono
+
+set -euo pipefail
+
+FONT_DIR="$HOME/Library/Fonts"
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+check_command() {
+    if ! command -v "$1" &>/dev/null; then
+        error "$1 が見つかりません。インストールしてください。"
+        exit 1
+    fi
+}
+
+install_font_file() {
+    local src="$1"
+    local name
+    name=$(basename "$src")
+    if [[ -f "$FONT_DIR/$name" ]]; then
+        warn "スキップ (既存): $name"
+    else
+        cp "$src" "$FONT_DIR/$name"
+        info "インストール済み: $name"
+    fi
+}
+
+# ─────────────────────────────────────────
+# 1. MesloLGS NF (Powerlevel10k 推奨フォント)
+# ─────────────────────────────────────────
+install_meslolgs() {
+    info "=== MesloLGS NF のインストール ==="
+    local base="https://github.com/romkatv/powerlevel10k-media/raw/master"
+    local files=(
+        "MesloLGS%20NF%20Regular.ttf"
+        "MesloLGS%20NF%20Bold.ttf"
+        "MesloLGS%20NF%20Italic.ttf"
+        "MesloLGS%20NF%20Bold%20Italic.ttf"
+    )
+    for encoded in "${files[@]}"; do
+        local decoded="${encoded//%20/ }"
+        local dest="$TMP_DIR/$decoded"
+        info "ダウンロード中: $decoded"
+        curl -fsSL "$base/$encoded" -o "$dest"
+        install_font_file "$dest"
+    done
+}
+
+# ─────────────────────────────────────────
+# 2. JetBrains Mono
+# ─────────────────────────────────────────
+install_jetbrains_mono() {
+    info "=== JetBrains Mono のインストール ==="
+    local api="https://api.github.com/repos/JetBrains/JetBrainsMono/releases/latest"
+    local zip_url
+    zip_url=$(curl -fsSL "$api" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for a in data['assets']:
+    if a['name'].endswith('.zip') and 'JetBrainsMono' in a['name']:
+        print(a['browser_download_url'])
+        break
+")
+    if [[ -z "$zip_url" ]]; then
+        error "JetBrains Mono のダウンロード URL を取得できませんでした"
+        return 1
+    fi
+    local zip="$TMP_DIR/JetBrainsMono.zip"
+    info "ダウンロード中: $zip_url"
+    curl -fsSL "$zip_url" -o "$zip"
+    local extract="$TMP_DIR/JetBrainsMono"
+    mkdir -p "$extract"
+    unzip -q "$zip" -d "$extract"
+    # ttf フォルダから通常書体のみインストール
+    find "$extract" -name "*.ttf" | while read -r f; do
+        install_font_file "$f"
+    done
+}
+
+# ─────────────────────────────────────────
+# 3. Hack Nerd Font Mono
+# ─────────────────────────────────────────
+install_hack_nerd_font() {
+    info "=== Hack Nerd Font Mono のインストール ==="
+    local api="https://api.github.com/repos/ryanoasis/nerd-fonts/releases/latest"
+    local zip_url
+    zip_url=$(curl -fsSL "$api" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for a in data['assets']:
+    if a['name'] == 'Hack.zip':
+        print(a['browser_download_url'])
+        break
+")
+    if [[ -z "$zip_url" ]]; then
+        error "Hack Nerd Font のダウンロード URL を取得できませんでした"
+        return 1
+    fi
+    local zip="$TMP_DIR/HackNerdFont.zip"
+    info "ダウンロード中: $zip_url"
+    curl -fsSL "$zip_url" -o "$zip"
+    local extract="$TMP_DIR/HackNerdFont"
+    mkdir -p "$extract"
+    unzip -q "$zip" -d "$extract"
+    find "$extract" -name "*.ttf" -o -name "*.otf" | while read -r f; do
+        install_font_file "$f"
+    done
+}
+
+# ─────────────────────────────────────────
+# メイン
+# ─────────────────────────────────────────
+check_command curl
+check_command python3
+check_command unzip
+
+mkdir -p "$FONT_DIR"
+
+install_meslolgs
+install_jetbrains_mono
+install_hack_nerd_font
+
+info ""
+info "=== 完了 ==="
+info "フォントキャッシュを更新しています..."
+if command -v fc-cache &>/dev/null; then
+    fc-cache -fv "$FONT_DIR" &>/dev/null
+fi
+
+info "インストールされたフォント一覧:"
+echo ""
+printf "  %-40s %s\n" "フォント名" "場所"
+printf "  %-40s %s\n" "$(printf '%0.s-' {1..40})" "$(printf '%0.s-' {1..20})"
+find "$FONT_DIR" -name "MesloLGS*" -o -name "JetBrainsMono*" -o -name "HackNerdFont*" 2>/dev/null \
+    | sort \
+    | while read -r f; do
+        printf "  %-40s %s\n" "$(basename "$f")" "$FONT_DIR"
+    done
+
+echo ""
+info "VS Code / Antigravity を再起動するとフォントが反映されます。"
+info "Terminal.app はフォント設定画面から選択してください。"
