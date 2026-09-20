@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# fix-claude-url-handler
+#
+# Claude Desktop (Linux) のサインインが
+#   「Claudeアプリでサインインを完了する」→「Claudeを開く」→
+#   "Open With… / No Apps available"
+# で止まる問題を直すスクリプト。
+#
+# 原因:
+#   サインインは claude:// というカスタム URL スキームでアプリに認証コードを
+#   受け渡す。Claude Desktop は起動のたびに
+#   ~/.local/share/applications/com.anthropic.Claude.desktop を自動生成するが、
+#   このファイルは GIO のアプリ列挙から漏れる（default としては解決されるのに
+#   "No registered applications" になる）ため、ブラウザ側は
+#   「開けるアプリが無い」と表示してしまう。
+#   さらにこのファイルは /usr/share/applications 側の正しいエントリを
+#   同名でシャドウする。
+#
+# 対処:
+#   アプリが触らない別名の .desktop（claude-url-handler.desktop）を自分で作り、
+#   claude:// の既定ハンドラをそちらに向ける。アプリが壊れたエントリを
+#   再生成しても、こちらの設定が優先されるので再発しない。
+#
+# 使い方:
+#   fix-claude-url-handler            # 診断して修復
+#   fix-claude-url-handler --check    # 診断のみ（何も書き換えない）
+#   fix-claude-url-handler --test     # claude:// を実際に開いて動作確認
+#   fix-claude-url-handler --undo     # このスクリプトが作った設定を取り消す
+
+set -euo pipefail
+
+SCHEME="x-scheme-handler/claude"
+HANDLER_ID="claude-url-handler.desktop"
+APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
+HANDLER="$APP_DIR/$HANDLER_ID"
+GENERATED="$APP_DIR/com.anthropic.Claude.desktop"
+MIMEAPPS="$CONFIG_DIR/mimeapps.list"
+STAMP="$(date +%Y%m%d%H%M%S)"
+
+info() { printf '  %s\n' "$*"; }
+step() { printf '\n==> %s\n' "$*"; }
+warn() { printf '  [!] %s\n' "$*" >&2; }
+
+# ---------------------------------------------------------------- detect app
+
+# Claude Desktop の起動コマンドを探す。見つかれば Exec 行に使う文字列を返す。
+detect_exec() {
+    local candidate
+
+    if candidate="$(command -v claude-desktop 2>/dev/null)"; then
+        printf '%s' "$candidate"
+        return 0
+    fi
+
+    if command -v flatpak >/dev/null 2>&1 &&
+        flatpak info com.anthropic.Claude >/dev/null 2>&1; then
+        printf '%s' 'flatpak run com.anthropic.Claude'
+        return 0
+    fi
+
+    for candidate in \
+        "$HOME/Applications"/*[Cc]laude*.AppImage \
+        "$HOME/.local/bin"/*[Cc]laude*.AppImage \
+        /opt/*[Cc]laude*.AppImage; do
+        if [ -x "$candidate" ]; then
+            printf '"%s"' "$candidate"
+            return 0
+        fi
+    done
+
+    # パッケージ同梱の .desktop から Exec= を拾う（%U などの引数は落とす）
+    for candidate in \
+        /usr/share/applications/com.anthropic.Claude.desktop \
+        /usr/share/applications/claude-desktop.desktop; do
+        if [ -r "$candidate" ]; then
+            sed -n 's/^Exec=//p' "$candidate" |
+                head -1 |
+                sed 's/ *%[fFuUdDnNickvm]//g'
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# ------------------------------------------------------------------ diagnose
+
+diagnose() {
+    step "現在の状態"
+
+    if [ -f "$GENERATED" ]; then
+        if grep -q '^X-Claude-Generated=true' "$GENERATED"; then
+            warn "アプリが自動生成した壊れたエントリがあります: $GENERATED"
+        else
+            info "ユーザー側エントリあり（自動生成ではない）: $GENERATED"
+        fi
+    else
+        info "ユーザー側の com.anthropic.Claude.desktop はありません"
+    fi
+
+    if [ -f "$HANDLER" ]; then
+        info "このスクリプトのハンドラあり: $HANDLER"
+    else
+        info "このスクリプトのハンドラは未作成"
+    fi
+
+    if command -v xdg-mime >/dev/null 2>&1; then
+        info "xdg-mime query default $SCHEME -> $(xdg-mime query default "$SCHEME" 2>/dev/null || echo '(なし)')"
+    else
+        warn "xdg-utils が未インストールです（sudo pacman -S xdg-utils）"
+    fi
+
+    if command -v gio >/dev/null 2>&1; then
+        info "gio mime $SCHEME:"
+        { gio mime "$SCHEME" 2>&1 || true; } | sed 's/^/      /'
+    else
+        warn "glib2（gio）が見つかりません"
+    fi
+}
+
+# ------------------------------------------------------------- default mime
+
+# xdg-mime が無い環境でも mimeapps.list を直接書けるようにしておく。
+set_default_via_mimeapps() {
+    local tmp
+    mkdir -p "$CONFIG_DIR"
+    [ -f "$MIMEAPPS" ] || printf '[Default Applications]\n' >"$MIMEAPPS"
+    cp "$MIMEAPPS" "$MIMEAPPS.bak.$STAMP"
+    tmp="$(mktemp)"
+
+    awk -v scheme="$SCHEME" -v handler="$HANDLER_ID" '
+        BEGIN { inserted = 0 }
+        # 既存の claude スキーム行はすべて捨てる
+        $0 ~ "^" scheme "[[:space:]]*=" { next }
+        {
+            print
+            if ($0 ~ /^\[Default Applications\][[:space:]]*$/ && !inserted) {
+                print scheme "=" handler
+                inserted = 1
+            }
+        }
+        END {
+            if (!inserted) {
+                print ""
+                print "[Default Applications]"
+                print scheme "=" handler
+            }
+        }
+    ' "$MIMEAPPS" >"$tmp"
+
+    mv "$tmp" "$MIMEAPPS"
+    info "書き換え: $MIMEAPPS （バックアップ: $MIMEAPPS.bak.$STAMP）"
+}
+
+# ----------------------------------------------------------------- actions
+
+do_fix() {
+    local exec_cmd
+
+    step "Claude Desktop の実行コマンドを探す"
+    if ! exec_cmd="$(detect_exec)" || [ -z "$exec_cmd" ]; then
+        warn "Claude Desktop が見つかりません。"
+        warn "Linux 版は非公式ビルドです。Arch なら例えば:"
+        warn "    yay -S claude-desktop-bin"
+        warn "を入れてから、もう一度このスクリプトを実行してください。"
+        exit 1
+    fi
+    info "$exec_cmd"
+
+    step "壊れた自動生成エントリを退避"
+    if [ -f "$GENERATED" ] && grep -q '^X-Claude-Generated=true' "$GENERATED"; then
+        mv "$GENERATED" "$GENERATED.bak.$STAMP"
+        info "退避しました: $GENERATED.bak.$STAMP"
+        info "（アプリ起動時にまた作られますが、以降は下のハンドラが優先されます）"
+    else
+        info "退避が必要なファイルはありません"
+    fi
+
+    step "claude:// 用ハンドラを作成"
+    mkdir -p "$APP_DIR"
+    # NoDisplay は付けない。付けるとランチャーからは消えるが、ブラウザが出す
+    # 「アプリで開く」ダイアログ（GtkAppChooser / xdg-desktop-portal）の一覧にも
+    # 出なくなり、今回の症状が再発しうるため。
+    cat >"$HANDLER" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Claude (claude:// link handler)
+Comment=Handles claude:// deep links such as the sign-in handoff
+Exec=$exec_cmd %u
+Icon=claude-desktop
+Terminal=false
+StartupNotify=true
+StartupWMClass=com.anthropic.Claude
+MimeType=$SCHEME;
+EOF
+    info "作成しました: $HANDLER"
+
+    if command -v desktop-file-validate >/dev/null 2>&1; then
+        if desktop-file-validate "$HANDLER"; then
+            info "desktop-file-validate: OK"
+        else
+            warn "desktop-file-validate が警告を出しました（上記参照）"
+        fi
+    fi
+
+    step "デスクトップデータベースを更新"
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$APP_DIR" || warn "update-desktop-database が失敗しました"
+        info "update-desktop-database 完了"
+    else
+        warn "update-desktop-database がありません（sudo pacman -S desktop-file-utils）"
+    fi
+
+    step "既定ハンドラを設定"
+    if command -v xdg-mime >/dev/null 2>&1 &&
+        xdg-mime default "$HANDLER_ID" "$SCHEME"; then
+        info "xdg-mime default $HANDLER_ID $SCHEME"
+    else
+        set_default_via_mimeapps
+    fi
+
+    diagnose
+
+    step "完了"
+    info "ブラウザに戻って「Claudeを開く」をもう一度押してください。"
+    info "動作確認だけしたい場合: fix-claude-url-handler --test"
+}
+
+do_test() {
+    local url='claude://claude.ai/new?source=fix-claude-url-handler'
+    step "claude:// を開いてみる"
+    if command -v xdg-open >/dev/null 2>&1; then
+        info "xdg-open $url"
+        xdg-open "$url"
+        info "Claude Desktop が前面に出れば成功です。"
+    elif command -v gio >/dev/null 2>&1; then
+        info "gio open $url"
+        gio open "$url"
+    else
+        warn "xdg-open も gio もありません"
+        exit 1
+    fi
+}
+
+do_undo() {
+    step "このスクリプトが作った設定を取り消す"
+    if [ -f "$HANDLER" ]; then
+        rm "$HANDLER"
+        info "削除しました: $HANDLER"
+    else
+        info "ハンドラはすでにありません"
+    fi
+
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$APP_DIR" || true
+    fi
+
+    warn "$MIMEAPPS の $SCHEME 行は手動で確認してください。"
+    warn "バックアップ: $MIMEAPPS.bak.*"
+}
+
+usage() {
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1-}" in
+    "") do_fix ;;
+    --check | -c) diagnose ;;
+    --test | -t) do_test ;;
+    --undo | -u) do_undo ;;
+    --help | -h) usage ;;
+    *)
+        warn "不明なオプション: $1"
+        usage
+        exit 2
+        ;;
+esac
