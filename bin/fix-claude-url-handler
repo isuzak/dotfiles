@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Claude Desktop (Linux) のログイン修正スクリプト
+#
+# 症状: ブラウザでサインイン後「Claudeアプリでサインインを完了する」画面で
+#       "No apps installed that can open claude://..." と表示されて戻ってこない。
+# 原因: claude:// (x-scheme-handler/claude) を開くアプリが XDG に登録されていない。
+# 対処: Claude Desktop の .desktop に MimeType と %u を付けて既定ハンドラに登録する。
+#
+# 実行ファイルを自動検出できない場合:
+#   CLAUDE_DESKTOP_EXEC=/path/to/Claude.AppImage fix-claude-url-handler
+
+set -euo pipefail
+
+MIME="x-scheme-handler/claude"
+APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+    error "このスクリプトは Linux 専用です"
+    exit 1
+fi
+
+for cmd in xdg-mime awk; do
+    if ! command -v "$cmd" &>/dev/null; then
+        error "$cmd が見つかりません (Arch: sudo pacman -S xdg-utils)"
+        exit 1
+    fi
+done
+
+# ─────────────────────────────────────────
+# 1. 既存の Claude Desktop 用 .desktop を探す
+# ─────────────────────────────────────────
+find_desktop_file() {
+    local dirs=("$APPS_DIR")
+    local d
+    IFS=: read -ra data_dirs <<< "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    for d in "${data_dirs[@]}" \
+             /usr/share /usr/local/share \
+             /var/lib/flatpak/exports/share \
+             "$HOME/.local/share/flatpak/exports/share"; do
+        dirs+=("$d/applications")
+    done
+    local f
+    for d in "${dirs[@]}"; do
+        for f in "$d"/*.desktop; do
+            [[ -f "$f" ]] || continue
+            # Name=Claude (Claude Code 等は除外) かつ Exec を持つもの
+            if grep -qxE 'Name=Claude( Desktop)?' "$f" && grep -q '^Exec=' "$f"; then
+                echo "$f"; return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# ─────────────────────────────────────────
+# 2. 見つからない場合は実行ファイルを探す
+# ─────────────────────────────────────────
+find_executable() {
+    if [[ -n "${CLAUDE_DESKTOP_EXEC:-}" ]]; then
+        echo "$CLAUDE_DESKTOP_EXEC"; return 0
+    fi
+    local c
+    for c in claude-desktop claude-desktop-bin; do
+        command -v "$c" &>/dev/null && { command -v "$c"; return 0; }
+    done
+    for c in "$HOME"/Applications/Claude*.AppImage "$HOME"/.local/bin/Claude*.AppImage \
+             "$HOME"/Downloads/Claude*.AppImage; do
+        [[ -x "$c" ]] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+mkdir -p "$APPS_DIR"
+
+src=""
+if src=$(find_desktop_file); then
+    info "既存の .desktop を検出: $src"
+    name=$(basename "$src")
+    dest="$APPS_DIR/$name"
+    # システム側のファイルは直接いじらず、同名のユーザー版で上書きする
+    [[ "$src" != "$dest" ]] && cp "$src" "$dest"
+else
+    exe=$(find_executable) || {
+        error "Claude Desktop の実行ファイルが見つかりません"
+        error "CLAUDE_DESKTOP_EXEC=/path/to/claude で指定して再実行してください"
+        exit 1
+    }
+    info "実行ファイルを検出: $exe"
+    name="claude-desktop.desktop"
+    dest="$APPS_DIR/$name"
+    cat > "$dest" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Claude
+Comment=Claude Desktop
+Exec="$exe" %u
+Icon=claude-desktop
+Terminal=false
+Categories=Office;Utility;
+StartupWMClass=Claude
+EOF
+fi
+
+# ─────────────────────────────────────────
+# 3. [Desktop Entry] に %u と MimeType を付与
+# ─────────────────────────────────────────
+tmp=$(mktemp)
+awk -v mime="$MIME" '
+    /^\[/ {
+        if (in_main && !has_mime) print "MimeType=" mime ";"
+        in_main = ($0 == "[Desktop Entry]")
+    }
+    in_main && /^Exec=/ && $0 !~ /%[uUfF]/ { $0 = $0 " %u" }
+    in_main && /^MimeType=/ {
+        has_mime = 1
+        if (index($0, mime) == 0) { sub(/;?$/, ";"); $0 = $0 mime ";" }
+    }
+    { print }
+    END { if (in_main && !has_mime) print "MimeType=" mime ";" }
+' "$dest" > "$tmp"
+mv "$tmp" "$dest"
+chmod 644 "$dest"
+info "更新: $dest"
+
+# ─────────────────────────────────────────
+# 4. 既定ハンドラに登録
+# ─────────────────────────────────────────
+xdg-mime default "$name" "$MIME"
+if command -v update-desktop-database &>/dev/null; then
+    update-desktop-database "$APPS_DIR" &>/dev/null || true
+else
+    warn "update-desktop-database が無いのでスキップ (desktop-file-utils)"
+fi
+
+current=$(xdg-mime query default "$MIME" || true)
+if [[ "$current" == "$name" ]]; then
+    info "登録完了: $MIME -> $current"
+    echo ""
+    info "ブラウザを再起動してから、もう一度 Claude Desktop でログインしてください。"
+else
+    error "登録に失敗しました (現在: ${current:-なし})"
+    exit 1
+fi
